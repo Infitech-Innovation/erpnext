@@ -6,6 +6,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.utils import flt, getdate, nowdate
 
@@ -232,6 +233,7 @@ def get_list_context(context=None):
 			"show_search": True,
 			"no_breadcrumbs": True,
 			"title": _("Supplier Quotation"),
+			"list_template": "templates/includes/list/list.html",
 		}
 	)
 
@@ -239,7 +241,9 @@ def get_list_context(context=None):
 
 
 @frappe.whitelist()
-def make_purchase_order(source_name, target_doc=None, args=None):
+def make_purchase_order(
+	source_name: str, target_doc: str | Document | None = None, args: str | dict | None = None
+):
 	if args is None:
 		args = {}
 	if isinstance(args, str):
@@ -293,7 +297,7 @@ def make_purchase_order(source_name, target_doc=None, args=None):
 
 
 @frappe.whitelist()
-def make_purchase_invoice(source_name, target_doc=None):
+def make_purchase_invoice(source_name: str, target_doc: str | Document | None = None):
 	doc = get_mapped_doc(
 		"Supplier Quotation",
 		source_name,
@@ -314,7 +318,7 @@ def make_purchase_invoice(source_name, target_doc=None):
 
 
 @frappe.whitelist()
-def make_quotation(source_name, target_doc=None):
+def make_quotation(source_name: str, target_doc: str | Document | None = None):
 	doclist = get_mapped_doc(
 		"Supplier Quotation",
 		source_name,
@@ -346,4 +350,16 @@ def set_expired_status():
 			`status` not in ('Cancelled', 'Stopped') AND `valid_till` < %s
 		""",
 		(nowdate()),
+	)
+
+
+def get_purchased_items(supplier_quotation: str):
+	return frappe._dict(
+		frappe.get_all(
+			"Purchase Order Item",
+			filters={"supplier_quotation": supplier_quotation, "docstatus": 1},
+			fields=["supplier_quotation_item", {"SUM": "qty"}],
+			group_by="supplier_quotation_item",
+			as_list=1,
+		)
 	)

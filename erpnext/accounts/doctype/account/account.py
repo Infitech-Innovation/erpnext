@@ -93,8 +93,10 @@ class Account(NestedSet):
 			super().on_update()
 
 	def onload(self):
-		frozen_accounts_modifier = frappe.get_single_value("Accounts Settings", "frozen_accounts_modifier")
-		if not frozen_accounts_modifier or frozen_accounts_modifier in frappe.get_roles():
+		role_allowed_for_frozen_entries = frappe.db.get_value(
+			"Company", self.company, "role_allowed_for_frozen_entries"
+		)
+		if not role_allowed_for_frozen_entries or role_allowed_for_frozen_entries in frappe.get_roles():
 			self.set_onload("can_freeze_account", True)
 
 	def autoname(self):
@@ -303,10 +305,10 @@ class Account(NestedSet):
 		if not doc_before_save or doc_before_save.freeze_account == self.freeze_account:
 			return
 
-		frozen_accounts_modifier = frappe.get_cached_value(
-			"Accounts Settings", "Accounts Settings", "frozen_accounts_modifier"
+		role_allowed_for_frozen_entries = frappe.get_cached_value(
+			"Company", self.company, "role_allowed_for_frozen_entries"
 		)
-		if not frozen_accounts_modifier or frozen_accounts_modifier not in frappe.get_roles():
+		if not role_allowed_for_frozen_entries or role_allowed_for_frozen_entries not in frappe.get_roles():
 			throw(_("You are not authorized to set Frozen value"))
 
 	def validate_balance_must_be_debit_or_credit(self):
@@ -469,7 +471,7 @@ class Account(NestedSet):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_parent_account(doctype, txt, searchfield, start, page_len, filters):
+def get_parent_account(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	return frappe.db.sql(
 		"""select name from tabAccount
 		where is_group = 1 and docstatus != 2 and company = {}
@@ -513,7 +515,9 @@ def get_account_autoname(account_number, account_name, company):
 
 
 @frappe.whitelist()
-def update_account_number(name, account_name, account_number=None, from_descendant=False):
+def update_account_number(
+	name: str, account_name: str, account_number: str | None = None, from_descendant: bool = False
+):
 	_ensure_idle_system()
 	account = frappe.get_cached_doc("Account", name)
 	if not account:
@@ -575,7 +579,7 @@ def update_account_number(name, account_name, account_number=None, from_descenda
 
 
 @frappe.whitelist()
-def merge_account(old, new):
+def merge_account(old: str, new: str):
 	_ensure_idle_system()
 	# Validate properties before merging
 	new_account = frappe.get_cached_doc("Account", new)
@@ -612,7 +616,7 @@ def merge_account(old, new):
 
 
 @frappe.whitelist()
-def get_root_company(company):
+def get_root_company(company: str):
 	# return the topmost company in the hierarchy
 	ancestors = get_ancestors_of("Company", company, "lft asc")
 	return [ancestors[0]] if ancestors else []

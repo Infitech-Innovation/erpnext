@@ -22,8 +22,9 @@ def after_install():
 		frappe.get_doc({"doctype": "Role", "role_name": "Analytics"}).insert()
 
 	set_single_defaults()
+	setup_repost_defaults()
 	create_print_setting_custom_fields()
-	create_marketgin_campagin_custom_fields()
+	create_marketing_campaign_custom_fields()
 	create_custom_company_links()
 	add_all_roles_to("Administrator")
 	create_default_success_action()
@@ -35,7 +36,9 @@ def after_install():
 	update_roles()
 	make_default_operations()
 	update_pegged_currencies()
+	set_default_print_formats()
 	create_letter_head()
+	toggle_hidden_fields()
 	frappe.db.commit()
 
 
@@ -73,13 +76,20 @@ def set_single_defaults():
 	setup_currency_exchange()
 
 
+def setup_repost_defaults():
+	accounts_settings = frappe.get_doc("Accounts Settings")
+	for x in frappe.get_hooks("repost_allowed_doctypes"):
+		accounts_settings.append("repost_allowed_types", {"document_type": x})
+	accounts_settings.save()
+
+
 def setup_currency_exchange():
 	ces = frappe.get_single("Currency Exchange Settings")
 	try:
 		ces.set("result_key", [])
 		ces.set("req_params", [])
 
-		ces.api_endpoint = "https://api.frankfurter.app/{transaction_date}"
+		ces.api_endpoint = "https://api.frankfurter.dev/v1/{transaction_date}"
 		ces.append("result_key", {"key": "rates"})
 		ces.append("result_key", {"key": "{to_currency}"})
 		ces.append("req_params", {"key": "base", "value": "{from_currency}"})
@@ -119,16 +129,16 @@ def create_print_setting_custom_fields():
 	)
 
 
-def create_marketgin_campagin_custom_fields():
+def create_marketing_campaign_custom_fields():
 	create_custom_fields(
 		{
 			"UTM Campaign": [
 				{
-					"label": _("Messaging CRM Campagin"),
+					"label": _("Messaging CRM Campaign"),
 					"fieldname": "crm_campaign",
 					"fieldtype": "Link",
 					"options": "Campaign",
-					"insert_after": "campaign_decription",
+					"insert_after": "campaign_description",
 				},
 			]
 		}
@@ -282,11 +292,54 @@ def update_pegged_currencies():
 		{"source_currency": "SAR", "pegged_against": "USD", "pegged_exchange_rate": 3.75},
 	]
 
+	# Add items on pegged_currency_item if source_currency and pegged_against currency doc exist.
+
+	currencies_exist = frappe.db.get_list(
+		"Currency", {"name": ["in", ["AED", "BHD", "JOD", "OMR", "QAR", "SAR", "USD"]]}, pluck="name"
+	)
+
+	if "USD" not in currencies_exist:
+		return
+
 	for currency in currencies_to_add:
-		if currency["source_currency"] not in existing_sources:
+		if (
+			currency["source_currency"] in currencies_exist
+			and currency["source_currency"] not in existing_sources
+		):
 			doc.append("pegged_currency_item", currency)
 
 	doc.save()
+
+
+def set_default_print_formats():
+	default_map = {
+		"Sales Order": "Sales Order with Item Image",
+		"Sales Invoice": "Sales Invoice with Item Image",
+		"Delivery Note": "Delivery Note with Item Image",
+		"Purchase Order": "Purchase Order with Item Image",
+		"Purchase Invoice": "Purchase Invoice with Item Image",
+		"POS Invoice": "POS Invoice with Item Image",
+		"Quotation": "Quotation with Item Image",
+		"Request for Quotation": "Request for Quotation with Item Image",
+	}
+
+	for doctype, print_format in default_map.items():
+		if frappe.get_meta(doctype).default_print_format:
+			continue
+
+		if not frappe.db.exists("Print Format", print_format):
+			continue
+
+		frappe.make_property_setter(
+			{
+				"doctype": doctype,
+				"doctype_or_field": "DocType",
+				"property": "default_print_format",
+				"value": print_format,
+				"property_type": "Link",
+			},
+			validate_fields_for_doctype=False,
+		)
 
 
 def create_letter_head():
@@ -306,9 +359,26 @@ def create_letter_head():
 					"letter_head_name": name,
 					"source": "HTML",
 					"content": content,
+					"is_default": 1 if name == "Company Letterhead - Grey" else 0,
+					"letter_head_for": "Report",
 				}
 			)
 			doc.insert(ignore_permissions=True)
+
+
+def toggle_hidden_fields():
+	from erpnext.accounts.doctype.accounts_settings.accounts_settings import (
+		toggle_accounting_dimension_sections,
+		toggle_loyalty_point_program_section,
+		toggle_sales_discount_section,
+		toggle_subscription_sections,
+	)
+
+	acc_settings = frappe.get_doc("Accounts Settings")
+	toggle_accounting_dimension_sections(not acc_settings.enable_accounting_dimensions)
+	toggle_sales_discount_section(not acc_settings.enable_discounts_and_margin)
+	toggle_subscription_sections(not acc_settings.enable_subscription)
+	toggle_loyalty_point_program_section(not acc_settings.enable_loyalty_point_program)
 
 
 DEFAULT_ROLE_PROFILES = {

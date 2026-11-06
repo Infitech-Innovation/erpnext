@@ -6,8 +6,6 @@
 
 
 import frappe
-import frappe.model
-from frappe.tests import IntegrationTestCase
 from frappe.utils import flt, today
 
 from erpnext.controllers.accounts_controller import InvalidQtyError
@@ -20,10 +18,15 @@ from erpnext.stock.doctype.material_request.material_request import (
 	make_supplier_quotation,
 	raise_work_orders,
 )
+from erpnext.stock.doctype.stock_entry.stock_entry import make_stock_in_entry
 from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+from erpnext.tests.utils import ERPNextTestSuite
 
 
-class TestMaterialRequest(IntegrationTestCase):
+class TestMaterialRequest(ERPNextTestSuite):
+	def setUp(self):
+		self.load_test_records("Material Request")
+
 	def test_material_request_qty(self):
 		mr = frappe.copy_doc(self.globalTestRecords["Material Request"][0])
 		mr.items[0].qty = 0
@@ -934,6 +937,33 @@ class TestMaterialRequest(IntegrationTestCase):
 		self.assertEqual(mr.per_ordered, 100)
 		self.assertEqual(mr.status, "Ordered")
 
+	def test_customer_provided_received_status(self):
+		create_item("CUST-0989", is_customer_provided_item=1, customer="_Test Customer", is_purchase_item=0)
+
+		mr = make_material_request(item_code="CUST-0989", material_request_type="Customer Provided")
+		se = make_stock_entry(mr.name)
+		se.insert()
+		se.submit()
+
+		mr.reload()
+
+		self.assertEqual(mr.per_ordered, 100)
+		self.assertEqual(mr.status, "Received")
+
+	def test_customer_provided_partially_received_status(self):
+		create_item("CUST-0990", is_customer_provided_item=1, customer="_Test Customer", is_purchase_item=0)
+
+		mr = make_material_request(item_code="CUST-0990", qty=10, material_request_type="Customer Provided")
+		se = make_stock_entry(mr.name)
+		se.get("items")[0].qty = 5
+		se.insert()
+		se.submit()
+
+		mr.reload()
+
+		self.assertEqual(mr.per_ordered, 50)
+		self.assertEqual(mr.status, "Partially Received")
+
 	def test_material_request_qty_over_sales_order_limit(self):
 		from erpnext.controllers.status_updater import OverAllowanceError
 		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
@@ -946,20 +976,71 @@ class TestMaterialRequest(IntegrationTestCase):
 
 		self.assertRaises(OverAllowanceError, mr.submit)
 
+	def test_get_remaining_qty_from_sales_order(self):
+		from frappe.utils import add_to_date, today
+
+		from erpnext.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+		from erpnext.selling.doctype.sales_order.sales_order import make_material_request
+		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
+
+		sub_item_a = "_Test Bundle ItemA"
+		create_item(sub_item_a, is_customer_provided_item=1, customer="_Test Customer", is_purchase_item=0)
+
+		sub_item_b = "_Test Bundle ItemB"
+		create_item(sub_item_b, is_customer_provided_item=1, customer="_Test Customer", is_purchase_item=0)
+
+		bundle_item = "_Test Bundle"
+		create_item(
+			bundle_item,
+			is_stock_item=0,
+			is_customer_provided_item=1,
+			customer="_Test Customer",
+			is_purchase_item=0,
+		)
+
+		make_product_bundle(parent=bundle_item, items=[sub_item_a, sub_item_b])
+
+		so = make_sales_order(item_code=bundle_item)
+		so.submit()
+
+		mr = make_material_request(so.name)
+		mr.schedule_date = add_to_date(today(), days=1, as_string=True)
+		mr.get("items")[0].qty = 5
+		mr.get("items")[1].qty = 5
+		mr.insert()
+		mr.submit()
+
+		mr = make_material_request(so.name)
+
+		self.assertEqual(mr.items[0].qty, 5)
+		self.assertEqual(mr.items[1].qty, 5)
+
 	def test_pending_qty_in_pick_list(self):
 		"""Test for pick list mapped doc qty from partially received Material Request Transfer"""
 		import json
 
 		from erpnext.stock.doctype.pick_list.pick_list import create_stock_entry
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 
-		mr = make_material_request(material_request_type="Material Transfer")
+		new_item = create_item("_Test Pick List Item", is_stock_item=1)
+		item_code = new_item.name
+
+		make_stock_entry(
+			item_code=item_code,
+			target="_Test Warehouse - _TC",
+			qty=10,
+			do_not_save=False,
+			do_not_submit=False,
+		)
+
+		mr = make_material_request(item_code=item_code, material_request_type="Material Transfer")
 		pl = create_pick_list(mr.name)
 		pl.save()
 		pl.locations[0].qty = 5
 		pl.locations[0].stock_qty = 5
 		pl.submit()
 
-		to_warehouse = create_warehouse("Test To Warehouse")
+		to_warehouse = create_warehouse("_Test Warehouse - _TC")
 
 		se_data = create_stock_entry(json.dumps(pl.as_dict()))
 		se = frappe.get_doc(se_data)
@@ -975,6 +1056,92 @@ class TestMaterialRequest(IntegrationTestCase):
 
 		pl_for_pending = create_pick_list(mr.name)
 		self.assertEqual(pl_for_pending.locations[0].qty, 5)
+
+	def test_mr_pick_list_qty_validation(self):
+		"""Test for checking pick list qty validation from Material Request"""
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+
+		make_stock_entry(
+			item_code="_Test Item",
+			target="_Test Warehouse - _TC",
+			qty=10,
+			do_not_save=False,
+			do_not_submit=False,
+		)
+
+		mr = make_material_request(material_request_type="Material Transfer")
+		pl = create_pick_list(mr.name)
+		pl.locations[0].qty = 9
+		pl.locations[0].stock_qty = 9
+		pl.submit()
+
+		mr.reload()
+		self.assertEqual(mr.items[0].picked_qty, 9)
+
+		pl = create_pick_list(mr.name)
+		self.assertEqual(pl.locations[0].qty, 1)
+
+		pl.locations[0].qty = 2
+		pl.locations[0].stock_qty = 2
+
+		# System should allow picking qty for excess transfer
+		pl.submit()
+
+	def test_mr_status_with_partial_and_excess_end_transit(self):
+		material_request = make_material_request(
+			material_request_type="Material Transfer",
+			item_code="_Test Item Home Desktop 100",
+		)
+
+		in_transit_wh = get_in_transit_warehouse(material_request.company)
+
+		# Make sure stock is available in source warehouse
+		self._insert_stock_entry(20.0, 20.0)
+
+		# Stock Entry (Transfer to In-Transit)
+		stock_entry_1 = make_in_transit_stock_entry(material_request.name, in_transit_wh)
+		stock_entry_1.items[0].update(
+			{
+				"qty": 5,
+				"s_warehouse": "_Test Warehouse 1 - _TC",
+			}
+		)
+		stock_entry_1.save().submit()
+
+		stock_entry_2 = make_in_transit_stock_entry(material_request.name, in_transit_wh)
+		stock_entry_2.items[0].update(
+			{
+				"qty": 5,
+				"s_warehouse": "_Test Warehouse 1 - _TC",
+			}
+		)
+		stock_entry_2.save().submit()
+
+		end_transit_1 = make_stock_in_entry(stock_entry_1.name)
+		end_transit_1.save().submit()
+
+		# Material Request Transfer Status should still be In Transit
+		material_request.load_from_db()
+		self.assertEqual(material_request.transfer_status, "In Transit")
+
+		end_transit_2 = make_stock_in_entry(stock_entry_2.name)
+		end_transit_2.items[0].update({"qty": 6})  # More than transferred
+		end_transit_2.save()
+
+		self.assertRaises(frappe.ValidationError, end_transit_2.submit)
+
+	def test_make_stock_entry_material_issue_warehouse_mapping(self):
+		"""Test to ensure while making stock entry from material request of type Material Issue, warehouse is mapped correctly"""
+		mr = make_material_request(material_request_type="Material Issue", do_not_submit=True)
+		mr.set_warehouse = "_Test Warehouse - _TC"
+		mr.save()
+		mr.submit()
+
+		se = make_stock_entry(mr.name)
+		self.assertEqual(se.from_warehouse, "_Test Warehouse - _TC")
+		self.assertIsNone(se.to_warehouse)
+		se.save()
+		se.submit()
 
 
 def get_in_transit_warehouse(company):
@@ -1010,7 +1177,8 @@ def make_material_request(**args):
 	mr = frappe.new_doc("Material Request")
 	mr.material_request_type = args.material_request_type or "Purchase"
 	mr.company = args.company or "_Test Company"
-	mr.customer = args.customer or "_Test Customer"
+	if mr.material_request_type == "Customer Provided":
+		mr.customer = args.customer or "_Test Customer"
 	mr.append(
 		"items",
 		{
@@ -1019,6 +1187,7 @@ def make_material_request(**args):
 			"uom": args.uom or "_Test UOM",
 			"conversion_factor": args.conversion_factor or 1,
 			"schedule_date": args.schedule_date or today(),
+			"from_warehouse": args.from_warehouse,
 			"warehouse": args.warehouse or "_Test Warehouse - _TC",
 			"cost_center": args.cost_center or "_Test Cost Center - _TC",
 		},
@@ -1027,6 +1196,3 @@ def make_material_request(**args):
 	if not args.do_not_submit:
 		mr.submit()
 	return mr
-
-
-EXTRA_TEST_RECORD_DEPENDENCIES = ["Currency Exchange", "BOM"]

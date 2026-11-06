@@ -1,7 +1,6 @@
 # Copyright (c) 2017, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-
 import frappe
 from email_reply_parser import EmailReplyParser
 from frappe import _, qb
@@ -9,7 +8,7 @@ from frappe.desk.reportview import get_match_cond
 from frappe.model.document import Document
 from frappe.query_builder import Interval
 from frappe.query_builder.functions import Count, CurDate, Date, Sum, UnixTimestamp
-from frappe.utils import add_days, flt, get_datetime, get_link_to_form, get_time, get_url, nowtime, today
+from frappe.utils import add_days, flt, get_datetime, get_link_to_form, get_time, nowtime, today
 from frappe.utils.user import is_website_user
 
 from erpnext import get_default_company
@@ -127,22 +126,20 @@ class Project(Document):
 
 	def create_task_from_template(self, task_details):
 		return frappe.get_doc(
-			dict(
-				doctype="Task",
-				subject=task_details.subject,
-				project=self.name,
-				status="Open",
-				exp_start_date=self.calculate_start_date(task_details),
-				exp_end_date=self.calculate_end_date(task_details),
-				description=task_details.description,
-				task_weight=task_details.task_weight,
-				type=task_details.type,
-				issue=task_details.issue,
-				is_group=task_details.is_group,
-				color=task_details.color,
-				template_task=task_details.name,
-				priority=task_details.priority,
-			)
+			doctype="Task",
+			subject=task_details.subject,
+			project=self.name,
+			status="Open",
+			exp_start_date=self.calculate_start_date(task_details),
+			exp_end_date=self.calculate_end_date(task_details),
+			description=task_details.description,
+			task_weight=task_details.task_weight,
+			type=task_details.type,
+			issue=task_details.issue,
+			is_group=task_details.is_group,
+			color=task_details.color,
+			template_task=task_details.name,
+			priority=task_details.priority,
 		).insert()
 
 	def calculate_start_date(self, task_details):
@@ -282,6 +279,8 @@ class Project(Document):
 				Min(TimesheetDetail.from_time).as_("start_date"),
 				Max(TimesheetDetail.to_time).as_("end_date"),
 				Sum(TimesheetDetail.hours).as_("time"),
+				Sum(TimesheetDetail.base_costing_amount).as_("base_costing_amount"),
+				Sum(TimesheetDetail.base_billing_amount).as_("base_billing_amount"),
 			)
 			.where((TimesheetDetail.project == self.name) & (TimesheetDetail.docstatus == 1))
 		).run(as_dict=True)[0]
@@ -289,8 +288,8 @@ class Project(Document):
 		self.actual_start_date = from_time_sheet.start_date
 		self.actual_end_date = from_time_sheet.end_date
 
-		self.total_costing_amount = from_time_sheet.costing_amount
-		self.total_billable_amount = from_time_sheet.billing_amount
+		self.total_costing_amount = from_time_sheet.base_costing_amount
+		self.total_billable_amount = from_time_sheet.base_billing_amount
 		self.actual_time = from_time_sheet.time
 
 		self.update_purchase_costing()
@@ -308,6 +307,8 @@ class Project(Document):
 		self.gross_margin = flt(self.total_billed_amount) - expense_amount
 		if self.total_billed_amount:
 			self.per_gross_margin = (self.gross_margin / flt(self.total_billed_amount)) * 100
+		else:
+			self.per_gross_margin = 0
 
 	def update_purchase_costing(self):
 		total_purchase_cost = calculate_total_purchase_cost(self.name)
@@ -362,13 +363,18 @@ class Project(Document):
 		)
 
 		for user in self.users:
+			# process only users who haven't received the welcome email yet
 			if user.welcome_email_sent == 0:
-				frappe.sendmail(
-					user.user,
-					subject=_("Project Collaboration Invitation"),
-					content=content,
-				)
-				user.welcome_email_sent = 1
+				# fetch canonical User data (enabled status + latest email)
+				user_info = frappe.db.get_value("User", user.user, ["enabled", "email"], as_dict=True)
+				# send email only if user is enabled and has a valid email
+				if user_info and user_info.enabled and user_info.email:
+					frappe.sendmail(
+						recipients=[user_info.email],
+						subject=_("Project Collaboration Invitation"),
+						content=content,
+					)
+					user.welcome_email_sent = 1
 
 
 def get_timeline_data(doctype: str, name: str) -> dict[int, int]:
@@ -445,6 +451,7 @@ def get_list_context(context=None):
 			"title": _("Projects"),
 			"get_list": get_project_list,
 			"row_template": "templates/includes/projects/project_row.html",
+			"list_template": "templates/includes/list/list.html",
 		}
 	)
 
@@ -453,7 +460,7 @@ def get_list_context(context=None):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_users_for_project(doctype, txt, searchfield, start, page_len, filters):
+def get_users_for_project(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	conditions = []
 	return frappe.db.sql(
 		"""select name, concat_ws(' ', first_name, middle_name, last_name)
@@ -480,7 +487,7 @@ def get_users_for_project(doctype, txt, searchfield, start, page_len, filters):
 
 
 @frappe.whitelist()
-def get_cost_center_name(project):
+def get_cost_center_name(project: str):
 	return frappe.db.get_value("Project", project, "cost_center")
 
 
@@ -550,7 +557,7 @@ def allow_to_make_project_update(project, time, frequency):
 
 
 @frappe.whitelist()
-def create_duplicate_project(prev_doc, project_name):
+def create_duplicate_project(prev_doc: str, project_name: str):
 	"""Create duplicate project based on the old project"""
 	import json
 
@@ -602,7 +609,7 @@ def send_project_update_email_to_users(project):
 			"sent": 0,
 			"date": today(),
 			"time": nowtime(),
-			"naming_series": "UPDATE-.project.-.YY.MM.DD.-",
+			"naming_series": "UPDATE-.project.-.YY.MM.DD.-.####",
 		}
 	).insert()
 
@@ -690,7 +697,7 @@ def update_project_sales_billing():
 
 
 @frappe.whitelist()
-def create_kanban_board_if_not_exists(project):
+def create_kanban_board_if_not_exists(project: str):
 	from frappe.desk.doctype.kanban_board.kanban_board import quick_kanban_board
 
 	project = frappe.get_doc("Project", project)
@@ -701,7 +708,7 @@ def create_kanban_board_if_not_exists(project):
 
 
 @frappe.whitelist()
-def set_project_status(project, status):
+def set_project_status(project: str, status: str):
 	"""
 	set status for project and all related tasks
 	"""
@@ -718,7 +725,7 @@ def set_project_status(project, status):
 	project.save()
 
 
-def get_holiday_list(company=None):
+def get_holiday_list(company: str | None = None) -> str:
 	if not company:
 		company = get_default_company() or frappe.get_all("Company")[0].name
 

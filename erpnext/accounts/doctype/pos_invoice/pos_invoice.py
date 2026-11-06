@@ -4,6 +4,7 @@
 
 import frappe
 from frappe import _, bold
+from frappe.model.document import Document
 from frappe.model.mapper import map_child_doc, map_doc
 from frappe.query_builder.functions import IfNull, Sum
 from frappe.utils import cint, flt, get_link_to_form, getdate, nowdate
@@ -20,6 +21,11 @@ from erpnext.accounts.party import get_due_date, get_party_account
 from erpnext.controllers.queries import item_query as _item_query
 from erpnext.controllers.sales_and_purchase_return import get_sales_invoice_item_from_consolidated_invoice
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+from erpnext.stock.stock_ledger import is_negative_stock_allowed
+
+
+class ProductBundleStockValidationError(frappe.ValidationError):
+	pass
 
 
 class POSInvoice(SalesInvoice):
@@ -167,6 +173,7 @@ class POSInvoice(SalesInvoice):
 		terms: DF.TextEditor | None
 		territory: DF.Link | None
 		timesheets: DF.Table[SalesInvoiceTimesheet]
+		title: DF.Data | None
 		to_date: DF.Date | None
 		total: DF.Currency
 		total_advance: DF.Currency
@@ -395,32 +402,67 @@ class POSInvoice(SalesInvoice):
 
 		for d in self.get("items"):
 			if not d.serial_and_batch_bundle:
-				available_stock, is_stock_item, is_negative_stock_allowed = get_stock_availability(
-					d.item_code, d.warehouse
-				)
+				if frappe.db.exists("Product Bundle", d.item_code):
+					(
+						availability,
+						is_stock_item,
+						is_negative_stock_allowed,
+					) = get_product_bundle_stock_availability(d.item_code, d.warehouse, d.stock_qty)
+
+				else:
+					availability, is_stock_item, is_negative_stock_allowed = get_stock_availability(
+						d.item_code, d.warehouse
+					)
 
 				if is_negative_stock_allowed:
 					continue
 
-				item_code, warehouse, _qty = (
-					frappe.bold(d.item_code),
-					frappe.bold(d.warehouse),
-					frappe.bold(d.qty),
-				)
-				if is_stock_item and flt(available_stock) <= 0:
-					frappe.throw(
-						_("Row #{}: Item Code: {} is not available under warehouse {}.").format(
-							d.idx, item_code, warehouse
-						),
-						title=_("Item Unavailable"),
-					)
-				elif is_stock_item and flt(available_stock) < flt(d.stock_qty):
-					frappe.throw(
-						_("Row #{}: Stock quantity not enough for Item Code: {} under warehouse {}.").format(
-							d.idx, item_code, warehouse
-						),
-						title=_("Item Unavailable"),
-					)
+				if isinstance(availability, list):
+					error_msgs = []
+					for item in availability:
+						if flt(item["available"]) < flt(item["required"]):
+							error_msgs.append(
+								_("<li>Packed Item {0}: Required {1}, Available {2}</li>").format(
+									frappe.bold(item["item_code"]),
+									frappe.bold(flt(item["required"], 2)),
+									frappe.bold(flt(item["available"], 2)),
+								)
+							)
+
+					if error_msgs:
+						frappe.throw(
+							_(
+								"<b>Row #{0}:</b> Bundle {1} in warehouse {2} has insufficient packed items:<br><div style='margin-top: 15px;'><ul style='line-height: 0.8;'>{3}</ul></div>"
+							).format(
+								d.idx,
+								frappe.bold(d.item_code),
+								frappe.bold(d.warehouse),
+								"<br>".join(error_msgs),
+							),
+							title=_("Insufficient Stock for Product Bundle Items"),
+							exc=ProductBundleStockValidationError,
+						)
+
+				else:
+					item_code, warehouse = frappe.bold(d.item_code), frappe.bold(d.warehouse)
+					if is_stock_item and flt(availability) <= 0:
+						frappe.throw(
+							_("Row #{0}: Item {1} has no stock in warehouse {2}.").format(
+								d.idx, item_code, warehouse
+							),
+							title=_("Item Out of Stock"),
+						)
+					elif is_stock_item and flt(availability) < flt(d.stock_qty):
+						frappe.throw(
+							_("Row #{0}: Item {1} in warehouse {2}: Available {3}, Needed {4}.").format(
+								d.idx,
+								item_code,
+								warehouse,
+								frappe.bold(flt(availability, 2)),
+								frappe.bold(flt(d.stock_qty, 2)),
+							),
+							title=_("Insufficient Stock"),
+						)
 
 	def validate_is_pos_using_sales_invoice(self):
 		self.invoice_type_in_pos = frappe.db.get_single_value("POS Settings", "invoice_type")
@@ -713,7 +755,7 @@ class POSInvoice(SalesInvoice):
 		return profile
 
 	@frappe.whitelist()
-	def set_missing_values(self, for_validate=False):
+	def set_missing_values(self, for_validate: bool | None = False):
 		profile = self.set_pos_fields(for_validate)
 
 		if not self.debit_to:
@@ -814,7 +856,7 @@ class POSInvoice(SalesInvoice):
 			return frappe.get_doc("Payment Request", pr)
 
 	@frappe.whitelist()
-	def update_payments(self, payments):
+	def update_payments(self, payments: list):
 		if self.status == "Consolidated":
 			frappe.throw(_("Create Payment Entry for Consolidated POS Invoices."))
 
@@ -826,11 +868,16 @@ class POSInvoice(SalesInvoice):
 
 		idx = self.payments[-1].idx if self.payments else -1
 
+		self.reload()
+		self.flags.ignore_validate_update_after_submit = True
+
 		for d in payments:
 			idx += 1
 			payment = create_payments_on_invoice(self, idx, frappe._dict(d))
 			paid_amount += flt(payment.amount)
-			payment.submit()
+			self.append("payments", payment)
+
+		self.save()
 
 		paid_amount = flt(flt(paid_amount), self.precision("paid_amount"))
 		base_paid_amount = flt(flt(paid_amount * self.conversion_rate), self.precision("base_paid_amount"))
@@ -857,9 +904,7 @@ class POSInvoice(SalesInvoice):
 
 
 @frappe.whitelist()
-def get_stock_availability(item_code, warehouse):
-	from erpnext.stock.stock_ledger import is_negative_stock_allowed
-
+def get_stock_availability(item_code: str | None, warehouse: str):
 	if frappe.db.get_value("Item", item_code, "is_stock_item"):
 		is_stock_item = True
 		bin_qty = get_bin_qty(item_code, warehouse)
@@ -874,6 +919,26 @@ def get_stock_availability(item_code, warehouse):
 			is_stock_item = False
 			# Is a service item or non_stock item
 			return 0, is_stock_item, False
+
+
+def get_product_bundle_stock_availability(item_code, warehouse, item_qty):
+	is_stock_item = True
+	bundle = frappe.get_doc("Product Bundle", item_code)
+	availabilities = []
+	for bundle_item in bundle.items:
+		if frappe.get_value("Item", bundle_item.item_code, "is_stock_item"):
+			bin_qty = get_bin_qty(bundle_item.item_code, warehouse)
+			reserved_qty = get_pos_reserved_qty(bundle_item.item_code, warehouse)
+			available = bin_qty - reserved_qty
+			availabilities.append(
+				{
+					"item_code": bundle_item.item_code,
+					"required": bundle_item.qty * item_qty,
+					"available": available,
+				}
+			)
+
+	return availabilities, is_stock_item, is_negative_stock_allowed(item_code=item_code)
 
 
 def get_bundle_availability(bundle_item_code, warehouse):
@@ -962,14 +1027,14 @@ def get_pos_reserved_qty_from_table(child_table, item_code, warehouse):
 
 
 @frappe.whitelist()
-def make_sales_return(source_name, target_doc=None):
+def make_sales_return(source_name: str, target_doc: Document | str | None = None):
 	from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 	return make_return_doc("POS Invoice", source_name, target_doc)
 
 
 @frappe.whitelist()
-def make_merge_log(invoices):
+def make_merge_log(invoices: str | list):
 	import json
 
 	if isinstance(invoices, str):
@@ -1019,7 +1084,15 @@ def add_return_modes(doc, pos_profile):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def item_query(doctype, txt, searchfield, start, page_len, filters, as_dict=False):
+def item_query(
+	doctype: str,
+	txt: str,
+	searchfield: str,
+	start: int,
+	page_len: int,
+	filters: dict,
+	as_dict: bool = False,
+):
 	if pos_profile := filters.get("pos_profile")[1]:
 		pos_profile = frappe.get_cached_doc("POS Profile", pos_profile)
 		if item_groups := get_item_group(pos_profile):
